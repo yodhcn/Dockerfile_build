@@ -1,0 +1,295 @@
+name: Build Image Artifact
+
+# 通用镜像构建器：clone 任意 GitHub 仓库 -> find Dockerfile -> docker build -> 导出 tar.gz -> 上传 artifact
+# 不推送任何镜像仓库，产物只以 workflow artifact 形式交付。
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'GitHub 仓库：owner/repo 或完整 URL'
+        required: true
+        default: 'owner/repo'
+      ref:
+        description: '分支 / tag / commit SHA'
+        required: true
+        default: 'main'
+      image_name:
+        description: '目标镜像名（必须小写，可含 / 分级）'
+        required: true
+        default: 'my-app'
+      image_tag:
+        description: '目标镜像 tag'
+        required: true
+        default: 'latest'
+      dockerfile:
+        description: 'Dockerfile 相对仓库根的路径；留空则自动 find'
+        required: false
+        default: ''
+      context:
+        description: '构建上下文目录（相对仓库根）；留空 = 仓库根'
+        required: false
+        default: ''
+      build_args:
+        description: '额外 --build-arg，每行一个 KEY=VALUE'
+        required: false
+        default: ''
+      repo_token:
+        description: '仅私有仓库需要：具备 repo 读权限的 PAT（也可配名为 REPO_TOKEN 的 secret）'
+        required: false
+        default: ''
+      platform:
+        description: '目标平台'
+        required: false
+        default: 'linux/amd64'
+
+concurrency:
+  group: build-image-artifact-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SRC: ${{ github.workspace }}/src
+  OUT: ${{ runner.temp }}/out
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    env:
+      INPUT_REPO: ${{ inputs.repo }}
+      INPUT_REF: ${{ inputs.ref }}
+      INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+      INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+      INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+      INPUT_CONTEXT: ${{ inputs.context }}
+      INPUT_BUILD_ARGS: ${{ inputs.build_args }}
+      INPUT_PLATFORM: ${{ inputs.platform }}
+      REPO_TOKEN: ${{ inputs.repo_token || secrets.REPO_TOKEN }}
+
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      # ---------------------------------------------------------------- 1. 取源码
+      # 用 git init + 单 ref 浅 fetch，而不是 git clone --branch：
+      # 后者对 tag 以外的 commit SHA 会失败，前者分支 / tag / SHA 通吃。
+      - name: Fetch upstream source
+        run: |
+          set -euo pipefail
+          url="$INPUT_REPO"
+          case "$url" in
+            git@github.com:*) url="https://github.com/${url#git@github.com:}" ;;
+            *://*) ;;
+            *)                 url="https://github.com/${url}.git" ;;
+          esac
+          case "$url" in
+            *.git) ;;
+            *)     url="${url}.git" ;;
+          esac
+          if [ -n "${REPO_TOKEN:-}" ]; then
+            echo "::add-mask::$REPO_TOKEN"
+            case "$url" in
+              https://*) url="https://x-access-token:${REPO_TOKEN}@${url#https://}" ;;
+              *) echo "::error::repo_token 只对 https 形式生效：$INPUT_REPO"; exit 1 ;;
+            esac
+          fi
+
+          rm -rf "$SRC"
+          mkdir -p "$SRC"
+          git init -q "$SRC"
+          git -C "$SRC" remote add origin "$url"
+          git -C "$SRC" fetch -q --depth 1 origin "$INPUT_REF"
+          git -C "$SRC" checkout -q --detach FETCH_HEAD
+          commit="$(git -C "$SRC" rev-parse HEAD)"
+          rm -rf "$SRC/.git"
+          echo "UPSTREAM_URL=$url" >> "$GITHUB_ENV"
+          echo "UPSTREAM_COMMIT=$commit" >> "$GITHUB_ENV"
+          echo "已检出 ${INPUT_REPO}@${INPUT_REF} -> ${commit}"
+
+      # ---------------------------------------------------------- 2. find Dockerfile
+      # 默认优先级：精确名为 Dockerfile 的 > Dockerfile.* > *.dockerfile；同级按目录深度浅者优先。
+      - name: Locate Dockerfile
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+
+          if [ -n "$INPUT_DOCKERFILE" ]; then
+            [ -f "$INPUT_DOCKERFILE" ] || { echo "::error::指定的 Dockerfile 不存在：$INPUT_DOCKERFILE"; exit 1; }
+            df="$INPUT_DOCKERFILE"
+          else
+            mapfile -t cands < <(
+              find . \( -name .git -o -name node_modules \) -prune -o -type f \
+                \( -iname 'Dockerfile' -o -iname 'Dockerfile.*' -o -iname '*.dockerfile' \) -print \
+              | sed 's#^\./##' | sort
+            )
+            [ "${#cands[@]}" -gt 0 ] || { echo "::error::仓库中未找到任何 Dockerfile"; exit 1; }
+
+            df=""
+            best=""
+            for p in "${cands[@]}"; do
+              base="${p##*/}"
+              case "$base" in
+                Dockerfile)   prio=0 ;;
+                Dockerfile.*) prio=1 ;;
+                *)            prio=2 ;;
+              esac
+              depth="$(awk -F/ '{print NF-1}' <<< "$p")"
+              score=$(( prio * 1000 + depth ))
+              if [ -z "$df" ] || [ "$score" -lt "$best" ]; then df="$p"; best="$score"; fi
+            done
+          fi
+
+          # 上下文默认取仓库根（docker build -f <df> . 的语义），可用 context 输入覆盖
+          ctx="${INPUT_CONTEXT:-.}"
+          [ -d "$ctx" ] || { echo "::error::构建上下文目录不存在：$ctx"; exit 1; }
+
+          echo "DOCKERFILE=$df" >> "$GITHUB_ENV"
+          echo "BUILD_CONTEXT=$ctx" >> "$GITHUB_ENV"
+
+          {
+            echo "### Dockerfile 定位结果"
+            echo
+            echo '| 路径 | 选中 |'
+            echo '| --- | --- |'
+            if [ -n "${cands:-}" ]; then
+              for p in "${cands[@]}"; do
+                if [ "$p" = "$df" ]; then echo "| \`$p\` | ✅ |"; else echo "| \`$p\` | |"; fi
+              done
+            else
+              echo "| \`$df\` | ✅（手动指定） |"
+            fi
+            echo
+            echo "- 构建上下文：\`$ctx\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Dockerfile: $df / context: $ctx"
+
+      # --------------------------------------------------------- 3. 镜像名与产物名
+      - name: Resolve image and artifact names
+        run: |
+          set -euo pipefail
+          name="$(printf '%s' "$INPUT_IMAGE_NAME" | tr '[:upper:]' '[:lower:]')"
+          [ "$name" = "$INPUT_IMAGE_NAME" ] || echo "::warning::镜像名含大写，已自动转为小写：$name"
+          tag="$INPUT_IMAGE_TAG"
+          [ -n "$tag" ] || { echo "::error::image_tag 不能为空"; exit 1; }
+
+          safe="$(printf '%s' "${name}-${tag}" | sed -E 's#/#-#g; s#[^A-Za-z0-9._-]+#-#g')"
+          echo "IMAGE=${name}:${tag}" >> "$GITHUB_ENV"
+          echo "SAFE_NAME=$safe" >> "$GITHUB_ENV"
+          echo "镜像：${name}:${tag} / 产物前缀：$safe"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ------------------------------------------------------------------ 4. 构建
+      # load: true 必须有 —— 否则镜像只留在 buildx 缓存里，docker save 取不到。
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.SRC }}/${{ env.BUILD_CONTEXT }}
+          file: ${{ env.SRC }}/${{ env.DOCKERFILE }}
+          platforms: ${{ env.INPUT_PLATFORM }}
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.IMAGE }}
+          build-args: ${{ env.INPUT_BUILD_ARGS }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ------------------------------------------------------- 5. 导出 tar.gz
+      # 镜像动辄数 GB：artifact 单文件上限 10GB 是硬限制，必须先压缩再传。
+      - name: Save and package image
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          if command -v pigz >/dev/null 2>&1; then comp=pigz; else comp=gzip; fi
+          echo "压缩器：$comp"
+
+          docker save "$IMAGE" | "$comp" -c > "${OUT}/${SAFE_NAME}.tar.gz"
+
+          cd "$OUT"
+          tar_size="$(stat -c %s "${SAFE_NAME}.tar.gz")"
+          tar_sha="$(sha256sum "${SAFE_NAME}.tar.gz" | awk '{print $1}')"
+          if [ "$tar_size" -gt 9663676416 ]; then
+            echo "::error::产物 ${tar_size} 字节已接近 artifact 10GB 硬上限，无法上传"
+            exit 1
+          fi
+          sha256sum "${SAFE_NAME}.tar.gz" > "${SAFE_NAME}.tar.gz.sha256"
+
+          img_id="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+          img_size="$(docker image inspect --format '{{.Size}}' "$IMAGE")"
+          img_human="$(numfmt --to=iec --suffix=B "$img_size" 2>/dev/null || echo "${img_size} bytes")"
+
+          cat > "${SAFE_NAME}.manifest.txt" <<EOF
+          image:          ${IMAGE}
+          image_id:       ${img_id}
+          image_size:     ${img_size} bytes (${img_human})
+          platform:       ${INPUT_PLATFORM}
+          upstream_repo:  ${INPUT_REPO}
+          upstream_ref:   ${INPUT_REF}
+          upstream_sha:   ${UPSTREAM_COMMIT}
+          dockerfile:     ${DOCKERFILE}
+          build_context:  ${BUILD_CONTEXT}
+          tar_file:       ${SAFE_NAME}.tar.gz
+          tar_size:       ${tar_size} bytes
+          tar_sha256:     ${tar_sha}
+          workflow_run:   ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          sed -i 's/^          //' "${SAFE_NAME}.manifest.txt"
+
+          echo "TAR_SIZE=$tar_size" >> "$GITHUB_ENV"
+          echo "IMAGE_ID=$img_id" >> "$GITHUB_ENV"
+          echo "IMAGE_SIZE_HUMAN=$img_human" >> "$GITHUB_ENV"
+          ls -lh "$OUT"
+          cat "${SAFE_NAME}.manifest.txt"
+
+      - name: Write summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### 构建完成"
+            echo
+            echo '```'
+            echo "镜像        : ${IMAGE}"
+            echo "镜像 ID     : ${IMAGE_ID}"
+            echo "解压后体积  : ${IMAGE_SIZE_HUMAN}"
+            echo "平台        : ${INPUT_PLATFORM}"
+            echo "上游        : ${INPUT_REPO}@${INPUT_REF} (${UPSTREAM_COMMIT})"
+            echo "Dockerfile  : ${DOCKERFILE}  (context: ${BUILD_CONTEXT})"
+            echo "artifact    : ${SAFE_NAME}"
+            echo '```'
+            echo
+            echo "下载后导入："
+            echo
+            echo '```bash'
+            echo "docker load -i ${SAFE_NAME}.tar.gz"
+            echo "# 或 gunzip -c ${SAFE_NAME}.tar.gz | docker load"
+            echo "sha256sum -c ${SAFE_NAME}.tar.gz.sha256"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ------------------------------------------------------------- 6. 上传产物
+      # compression-level: 0 —— tar.gz 已压缩过，再压一遍纯烧 CPU 和上传时间。
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}
+          path: |
+            ${{ env.OUT }}/${{ env.SAFE_NAME }}.tar.gz
+            ${{ env.OUT }}/${{ env.SAFE_NAME }}.tar.gz.sha256
+            ${{ env.OUT }}/${{ env.SAFE_NAME }}.manifest.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+          overwrite: true
