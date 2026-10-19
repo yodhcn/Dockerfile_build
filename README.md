@@ -6,6 +6,8 @@
 
 ## 触发方式
 
+**仅手动触发**：`on` 里只有 `workflow_dispatch`，不响应 `push` / `pull_request`。
+
 `Actions` → `Build Image Artifact` → `Run workflow`，填写输入后运行。
 
 ## 输入参数

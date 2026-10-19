@@ -50,9 +50,10 @@ concurrency:
 permissions:
   contents: read
 
+# 注意：runner 上下文只在 step 级可用，不能出现在 workflow / job 级 env 里，
+# 所以产物目录 $OUT 在 shell 里用 $RUNNER_TEMP 拼，不在这里声明。
 env:
   SRC: ${{ github.workspace }}/src
-  OUT: ${{ runner.temp }}/out
 
 jobs:
   build:
@@ -212,7 +213,9 @@ jobs:
       - name: Save and package image
         run: |
           set -euo pipefail
+          OUT="${RUNNER_TEMP}/out"
           mkdir -p "$OUT"
+          echo "OUT=$OUT" >> "$GITHUB_ENV"
           if command -v pigz >/dev/null 2>&1; then comp=pigz; else comp=gzip; fi
           echo "压缩器：$comp"
 
@@ -286,9 +289,9 @@ jobs:
         with:
           name: ${{ env.SAFE_NAME }}
           path: |
-            ${{ env.OUT }}/${{ env.SAFE_NAME }}.tar.gz
-            ${{ env.OUT }}/${{ env.SAFE_NAME }}.tar.gz.sha256
-            ${{ env.OUT }}/${{ env.SAFE_NAME }}.manifest.txt
+            ${{ runner.temp }}/out/${{ env.SAFE_NAME }}.tar.gz
+            ${{ runner.temp }}/out/${{ env.SAFE_NAME }}.tar.gz.sha256
+            ${{ runner.temp }}/out/${{ env.SAFE_NAME }}.manifest.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
